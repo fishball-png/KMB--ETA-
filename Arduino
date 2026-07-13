@@ -1,0 +1,529 @@
+#include <SPI.h>
+#include <SD.h>
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <time.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+
+#define SD_CS 5
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite spr = TFT_eSprite(&tft);
+Preferences prefs;
+WebServer server(80);
+String savedDataJSON;
+String savedWeatherLocation = "黃大仙";  // 預設
+float currentT = 0;
+
+void drawBmp(const char *filename, int x, int y, int w, int h, bool toSprite = false) {
+  File bmpFile = SD.open(filename);
+  if (!bmpFile) return;
+  bmpFile.seek(54);
+
+  int rowSizeRaw = w * 3;
+  int rowSizePadded = (rowSizeRaw + 3) & ~3;
+  int padding = rowSizePadded - rowSizeRaw;
+  uint8_t lineBuffer[rowSizeRaw];
+
+  for (int i = h - 1; i >= 0; i--) {
+    bmpFile.read(lineBuffer, sizeof(lineBuffer));
+    for (int j = 0; j < w; j++) {
+      uint16_t color = tft.color565(lineBuffer[j * 3 + 2], lineBuffer[j * 3 + 1], lineBuffer[j * 3]);
+
+      if (toSprite) {
+        // 如果 toSprite 是 true，就畫進 Sprite (雙緩衝平滑更新)
+        spr.drawPixel(x + j, y + i, color);
+      } else {
+        // 如果是 false，直接畫在螢幕 (setup 初始化用)
+        tft.drawPixel(x + j, y + i, color);
+      }
+    }
+    if (padding > 0) bmpFile.seek(bmpFile.position() + padding);
+  }
+  bmpFile.close();
+}
+
+void drawBmpToSprite(const char *filename, int x, int y, int w, int h) {
+  File bmpFile = SD.open(filename);
+  if (!bmpFile) return;
+  bmpFile.seek(54);
+
+  int rowSizeRaw = w * 3;
+  int rowSizePadded = (rowSizeRaw + 3) & ~3;
+  int padding = rowSizePadded - rowSizeRaw;
+  uint8_t lineBuffer[rowSizeRaw];
+
+  for (int i = h - 1; i >= 0; i--) {
+    bmpFile.read(lineBuffer, sizeof(lineBuffer));
+    for (int j = 0; j < w; j++) {
+      uint16_t color = tft.color565(lineBuffer[j * 3 + 2], lineBuffer[j * 3 + 1], lineBuffer[j * 3]);
+      // 這裡改用 spr.drawPixel，畫在記憶體裡，使用者看不到
+      spr.drawPixel(x + j, y + i, color);
+    }
+    if (padding > 0) bmpFile.seek(bmpFile.position() + padding);
+  }
+  bmpFile.close();
+}
+
+void refreshLeftArea() {
+  static int maxT = 0, minT = 0, lastIconId = 51;
+  static float currentT = 0;
+
+  // --- 1. 抓取即時數據 (rhrread)：獲取實時圖示 & 黃大仙溫度 ---
+  // 1. 抓取即時數據 (rhrread)
+  {
+    HTTPClient http;
+    http.begin("https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=rhrread&lang=tc");
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+
+      // 先確認地點是否存在
+      int tempSectionPos = payload.indexOf("\"temperature\":");  // 先定位到溫度區塊
+      if (tempSectionPos != -1) {
+        int pos = payload.indexOf(savedWeatherLocation, tempSectionPos);  // 由溫度區塊開始搵黃大仙
+        if (pos != -1) {
+          int valPos = payload.indexOf("\"value\":", pos);
+          if (valPos != -1) {
+            int start = valPos + 8;
+            int end = payload.indexOf(",", start);
+
+            // 提取並轉換
+            String tempStr = payload.substring(start, end);
+            currentT = tempStr.toFloat();
+
+            Serial.print("Parsed Temp: ");
+            Serial.println(currentT);
+          }
+        }
+      }
+
+      // 抓實時圖示 (保持不變)
+      int iconPos = payload.indexOf("\"icon\":[");
+      if (iconPos != -1) {
+        int start = iconPos + 8;
+        lastIconId = payload.substring(start, payload.indexOf("]", start)).toInt();
+      }
+    }
+    http.end();
+  }
+
+  // --- 2. 抓取預報數據 (fnd)：獲取今日最高/最低溫 ---
+  {
+    HTTPClient http;
+    http.begin("https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=fnd&lang=tc");
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+
+      // 尋找最高溫 (forecastMaxtemp - 注意 API 是小寫 t)
+      int maxPos = payload.indexOf("forecastMaxtemp");
+      if (maxPos != -1) {
+        int valPos = payload.indexOf("\"value\":", maxPos);
+        if (valPos != -1) {
+          maxT = payload.substring(valPos + 8, payload.indexOf(",", valPos + 8)).toInt();
+        }
+      }
+
+      // 尋找最低溫 (forecastMintemp - 注意 API 是小寫 t)
+      int minPos = payload.indexOf("forecastMintemp");
+      if (minPos != -1) {
+        int valPos = payload.indexOf("\"value\":", minPos);
+        if (valPos != -1) {
+          minT = payload.substring(valPos + 8, payload.indexOf(",", valPos + 8)).toInt();
+        }
+      }
+      Serial.printf("Forecast Update: Max %d, Min %d\n", maxT, minT);
+    } else {
+      Serial.printf("FND HTTP Failed: %d\n", httpCode);
+    }
+    http.end();
+  }
+
+  // --- 第三階段：獲取時間並開始繪圖 ---
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+
+  if (spr.createSprite(166, 240)) {
+    // 1. 背景邏輯 (包含 night_cloud)
+    String bgFile;
+    bool isDay = (timeinfo.tm_hour >= 7 && timeinfo.tm_hour < 19);
+    if (lastIconId >= 60 && lastIconId <= 65) {
+      bgFile = isDay ? "/cloud.bmp" : "/night_cloud.bmp";
+    } else {
+      bgFile = isDay ? "/day.bmp" : "/night.bmp";
+    }
+    drawBmp(bgFile.c_str(), 0, 0, 166, 240, true);
+
+    // 3. 畫日期 (你的原本代碼：年份、月份偏移、日期偏移)
+    spr.loadFont("test_12", SD);
+    spr.setTextColor(TFT_WHITE);
+    // 年份 (43)
+    spr.drawNumber(timeinfo.tm_year + 1900, 36, 67);
+    spr.drawNumber(timeinfo.tm_year + 1900, 37, 67);
+    // 月份 (83)
+    // --- 繪製月份 ---
+    int mon = timeinfo.tm_mon + 1;  // 獲取實際月份 (0-11 轉為 1-12)
+
+    // 如果月份小於 10 (即 1-9 月)，x 設為 81；否則 (10-12 月) x 設為 78
+    int monX = (mon < 10) ? 81 : 78;
+
+    spr.drawNumber(mon, monX, 67);
+    spr.drawNumber(mon, monX + 1, 67);  // 加粗
+
+    // 日期 (108)
+    int day = timeinfo.tm_mday;
+    int dayX = (day < 10) ? 108 : 105;  // 如果是 10 號以後，向左移 3 像素
+    spr.drawNumber(day, dayX, 67);
+    spr.drawNumber(day, dayX + 1, 67);
+
+    spr.unloadFont();
+
+    spr.setTextDatum(MC_DATUM);
+    int centerX = 166 / 2;  // 83
+
+    // 2. 畫時間 (test_26) @ 48, 29
+    spr.setTextColor(TFT_WHITE);
+    spr.loadFont("test_26", SD);
+    char timeStr[6];
+    sprintf(timeStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+    spr.drawString(timeStr, centerX, 45);
+    spr.drawString(timeStr, centerX + 1, 45);  // 加粗
+    spr.unloadFont();
+
+    // 4. 畫當前溫度 (test_45) @ 54, 114
+    spr.loadFont("test_45", SD);
+    String numPart = String((int)currentT);
+    spr.drawString(numPart, centerX, 138);
+    spr.drawString(numPart, centerX + 1, 138);  // 加粗
+
+    // 2. 計算數字佔用的寬度，以便定位符號
+    int numWidth = spr.textWidth(numPart);
+    // 3. 把基準點改回左上角，把 ° 畫在數字右側
+    spr.setTextDatum(TL_DATUM);
+    // 計算符號的 X 位置：中心點 + 數字一半的寬度 + 5像素空隙
+    int degreeX = centerX + (numWidth / 2) + 3;
+    // 符號的 Y 通常要比數字高一點點，你可以微調這個 5
+    spr.drawString("°", degreeX, 113);
+    spr.unloadFont();
+
+    // 5. 畫最高/最低溫 (test_28)
+    spr.loadFont("test_32", SD);
+    // 最高溫 @ 35, 162
+    String maxStr = String(maxT) + "°";
+    spr.drawString(maxStr, 32, 163);
+    spr.drawString(maxStr, 33, 163);
+    // 最低溫 @ 119, 162
+    String minStr = String(minT) + "°";
+    spr.drawString(minStr, 103, 163);
+    spr.drawString(minStr, 104, 163);
+    spr.unloadFont();
+
+
+    // 6. 推送並釋放
+    spr.pushSprite(0, 0);
+    spr.deleteSprite();
+  }
+}
+
+// --- 2. 網頁介面邏輯 ---
+void handleRoot() {
+  String html = "<html><head><meta charset='UTF-8'>";
+  html.reserve(6000);
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no'>";
+  html += "<style>";
+  html += "body { font-family: -apple-system, sans-serif; background-color: #f2f2f7; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }";
+  html += ".card { background: white; width: 100%; max-width: 360px; padding: 25px; border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); box-sizing: border-box; }";
+  html += "h1 { font-size: 20px; text-align: center; margin-bottom: 20px; color: #1c1c1e; }";
+  html += "label { display: block; font-size: 11px; font-weight: 700; color: #E30613; margin: 12px 0 5px 0; text-transform: uppercase; letter-spacing: 0.5px; }";
+  html += "input, select { width: 100%; padding: 12px; margin-bottom: 10px; border: 1px solid #d1d1d6; border-radius: 12px; font-size: 15px; background: #fafafa; box-sizing: border-box; outline: none; }";
+  html += ".btn-add { width: 100%; padding: 12px; background: #1c1c1e; color: white; border: none; border-radius: 12px; font-weight: 600; margin-bottom: 20px; cursor: pointer; }";
+  html += ".btn-save { width: 100%; padding: 16px; background: #E30613; color: white; border: none; border-radius: 16px; font-size: 17px; font-weight: 600; cursor: pointer; margin-top: 10px; }";
+  html += ".route-item { background: #f9f9f9; padding: 12px; border-radius: 10px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; border-left: 4px solid #E30613; font-size: 14px; }";
+  html += ".remove-btn { color: #ff3b30; font-weight: bold; cursor: pointer; padding: 5px 10px; }";
+  html += ".btn-reset { margin-top: 30px; font-size: 12px; color: #8e8e93; background: none; border: 1px solid #d1d1d6; padding: 8px 15px; border-radius: 8px; cursor: pointer; }";
+  html += ".weather-box { background: #f2f2f7; padding: 15px; border-radius: 15px; margin-bottom: 20px; border: 1px dashed #d1d1d6; }";
+  html += "</style></head><body>";
+
+  html += "<div class='card'><h1>九巴巴士到站時間</h1>";
+
+  // --- 新增的天氣地區選擇區塊 ---
+  html += "<div class='weather-box'>";
+  html += "<label>🌡️ 天氣觀測地區</label>";
+  html += "<select id='weatherLoc'><option value='黃大仙'>載入中...</option></select>";
+  html += "</div>";
+
+  html += "<label>💡 螢幕亮度</label>";
+html += "<input type='range' id='brightness' min='10' max='255' value='128' onchange='updateBrightness(this.value)'>";
+
+  html += "<label>🚌 巴士路線</label><input type='text' id='routeInput' placeholder='例如: 243M' onchange='updateStops()'>";
+  html += "<label>方向</label><select id='dirInput' onchange='updateStops()'><option value='outbound'>去程 (Outbound)</option><option value='inbound'>回程 (Inbound)</option></select>";
+  html += "<label>服務類型</label><select id='serviceInput' onchange='updateStops()'><option value='1'>常規服務 (1)</option><option value='2'>特別班次 (2)</option></select>";
+  html += "<label>選擇車站</label><select id='stopSelect'><option>請先輸入路線...</option></select>";
+  html += "<button class='btn-add' onclick='addRoute()'>＋ 新增至清單</button>";
+
+  html += "<form action='/save' method='POST' onsubmit='prepareSubmit()'>";
+  html += "<label>巴士路線</label><div id='routeList'></div>";
+  html += "<input type='hidden' name='fullData' id='fullData'>";
+  html += "<input type='hidden' name='weatherLocData' id='weatherLocData'>";  // 隱藏欄位傳送地點
+  html += "<input type='submit' class='btn-save' value='儲存並更新件'>";
+  html += "</form></div>";
+
+  html += "<button class='btn-reset' onclick='if(confirm(\"確定要清除 WiFi 嗎？\")) location.href=\"/reset_wifi\"'>重設 WiFi</button>";
+
+  // --- JavaScript 部分 ---
+  html += "<script>";
+  html += "let selectedRoutes = " + (savedDataJSON.length() > 5 ? savedDataJSON : "[]") + ";";
+  // 假設你有儲存先前的地區，這部分可以根據你的儲存變數調整
+  html += "let currentLoc = '" + savedWeatherLocation + "';";
+
+  html += "function renderList() { const list = document.getElementById('routeList'); list.innerHTML = selectedRoutes.map((item, index) => `<div class='route-item'><span><b>${item.r}</b> - ${item.sn}</span><span class='remove-btn' onclick='removeRoute(${index})'>✕</span></div>`).join(''); }";
+
+  // 新增：獲取天文台所有地點
+  html += "async function loadWeatherLocs() { const sel = document.getElementById('weatherLoc'); try { const res = await fetch('https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=rhrread&lang=tc'); const json = await res.json(); sel.innerHTML = ''; json.temperature.data.forEach(item => { let opt = document.createElement('option'); opt.value = item.place; opt.innerHTML = item.place; if(item.place === currentLoc) opt.selected = true; sel.appendChild(opt); }); } catch(e) { sel.innerHTML = '<option value=\"黃大仙\">黃大仙 (預設)</option>'; } }";
+
+  html += "async function updateStops() { let r = document.getElementById('routeInput').value.toUpperCase().trim(); let d = document.getElementById('dirInput').value; let s = document.getElementById('serviceInput').value; const sel = document.getElementById('stopSelect'); if(!r) return; sel.innerHTML = '<option>搜尋中...</option>'; try { const res = await fetch(`https://data.etabus.gov.hk/v1/transport/kmb/route-stop/${r}/${d}/${s}`); const json = await res.json(); sel.innerHTML = ''; for(const stop of json.data) { const sRes = await fetch(`https://data.etabus.gov.hk/v1/transport/kmb/stop/${stop.stop}`); const sJson = await sRes.json(); let opt = document.createElement('option'); opt.value = stop.stop; opt.innerHTML = sJson.data.name_tc; sel.appendChild(opt); } } catch(e) { sel.innerHTML = '<option>找不到路線</option>'; } }";
+
+  html += "function addRoute() { const r = document.getElementById('routeInput').value.toUpperCase().trim(); const sid = document.getElementById('stopSelect').value; const sn = document.getElementById('stopSelect').options[document.getElementById('stopSelect').selectedIndex].text; if(!r || !sid || sid.includes('搜尋')) return; selectedRoutes.push({r: r, sid: sid, sn: sn}); renderList(); }";
+
+  html += "function removeRoute(i) { selectedRoutes.splice(i, 1); renderList(); }";
+  html += "function updateBrightness(val) { fetch('/set_brightness?v=' + val); }";
+  html += "function prepareSubmit() { ";
+  html += "  document.getElementById('fullData').value = JSON.stringify(selectedRoutes);";
+  html += "  document.getElementById('weatherLocData').value = document.getElementById('weatherLoc').value;";  // 將選定的地區填入隱藏欄位
+  html += "}";
+
+  html += "window.onload = () => { renderList(); loadWeatherLocs(); };";
+  html += "</script></body></html>";
+
+  server.send(200, "text/html; charset=UTF-8", html);
+}
+
+void handleSave() {
+  // 1. 開啟 Preferences
+  prefs.begin("KMB-ETA", false);
+
+  // 2. 儲存地點
+  if (server.hasArg("weatherLocData")) {
+    String newLoc = server.arg("weatherLocData");
+    savedWeatherLocation = newLoc;  // 更新記憶體變數
+    prefs.putString("location", newLoc);
+    Serial.println("Writing to Flash: " + newLoc);
+  }
+
+  // 3. 儲存巴士清單
+  if (server.hasArg("fullData")) {
+    savedDataJSON = server.arg("fullData");
+    prefs.putString("data", savedDataJSON);
+  }
+
+  // 4. 強制寫入並關閉 (非常重要)
+  // Preferences 在寫入字串時是異步的，延遲一下確保數據安全存入 Flash
+  delay(100);
+  prefs.end();
+
+  // 5. 先回傳網頁訊息給瀏覽器，讓網頁不要 Lag
+  String msg = "<html><meta charset='UTF-8'><body>儲存成功！地點已設為：" + savedWeatherLocation + "，正在重啟...</body>";
+  msg += "<script>setTimeout(()=>location.href='/', 3000)</script></html>";
+  server.send(200, "text/html", msg);
+
+  // 6. 給 ESP32 充足時間發送完網路封包後再重啟
+  Serial.println("Save complete. Restarting in 2 seconds...");
+  delay(2000);
+  ESP.restart();
+}
+
+void handleResetWifi() {
+  server.send(200, "text/html; charset=UTF-8", "WiFi 已重置，正在進入 AP 模式...");
+  WiFiManager wm;
+  wm.resetSettings();
+  ESP.restart();
+}
+
+// --- 3. 巴士 UI 更新 ---
+void updateBusRow(int row, String route, String etaMin, String dest_tc) {
+  if (row > 3) return;
+  int yOffset = 40 + (row * 47);
+  uint16_t rowBgColor = (row == 0 || row == 2) ? TFT_WHITE : tft.color565(250, 240, 255);
+
+  if (!spr.createSprite(154, 47)) return;
+  spr.fillSprite(rowBgColor);
+
+  spr.setTextColor(tft.color565(57, 62, 68));
+  spr.loadFont("test_8", SD);
+  spr.drawString(route, 5, 4);
+  spr.unloadFont();
+
+
+  if (SD.exists("/test_3.vlw")) {
+    spr.loadFont("test_3", SD);
+    spr.drawString("往 " + dest_tc, 5, 32);
+    spr.unloadFont();
+  }
+
+  if (etaMin == "!") {
+    spr.drawSmoothCircle(137, 17, 12, tft.color565(41, 102, 163), rowBgColor);
+    spr.setTextColor(tft.color565(41, 102, 163));
+    spr.loadFont("test_16", SD);
+    spr.drawString("!", 136, 10);
+    spr.unloadFont();
+  } else {
+    spr.setTextDatum(TR_DATUM);
+    spr.setTextColor(tft.color565(41, 102, 163));
+    spr.loadFont("test_8", SD);
+    String displayStr = (etaMin == "0") ? "-" : etaMin;
+    // 邏輯：如果是 "-" 設為 139；如果長度是 1 (1-9) 設為 144；否則 (10+) 設為 149
+int xPos = (displayStr == "-") ? 141 : (displayStr.length() == 1 ? 144 : 149);
+    spr.drawString(displayStr, xPos, 4);
+    spr.setTextDatum(TL_DATUM);
+    spr.unloadFont();
+  }
+
+  spr.pushSprite(166, yOffset - 4);
+  spr.deleteSprite();
+}
+
+// --- 4. 數據抓取 ---
+void fetchMultiKMBData() {
+  if (WiFi.status() == WL_CONNECTED && savedDataJSON.length() > 5) {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) return;
+    time_t now;
+    time(&now);
+
+    DynamicJsonDocument configDoc(1024);
+    deserializeJson(configDoc, savedDataJSON);
+    JsonArray array = configDoc.as<JsonArray>();
+
+    int rowIndex = 0;
+    for (JsonObject obj : array) {
+      if (rowIndex >= 4) break;
+      String r = obj["r"].as<String>();
+      String sid = obj["sid"].as<String>();
+      HTTPClient http;
+      http.begin("https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/" + sid);
+
+      if (http.GET() == 200) {
+        DynamicJsonDocument etaDoc(20480);
+        deserializeJson(etaDoc, http.getStream());
+        bool found = false;
+        for (JsonObject bus : etaDoc["data"].as<JsonArray>()) {
+          if (bus["route"].as<String>() == r) {
+            String dest = bus["dest_tc"].as<String>();
+            if (bus["eta"].isNull()) {
+              updateBusRow(rowIndex, r, "!", dest);
+              found = true;
+              break;
+            }
+            const char *etaChar = bus["eta"];
+            if (etaChar && strlen(etaChar) >= 19) {
+              String etaStr = String(etaChar);
+              struct tm etaTm = { 0 };
+              etaTm.tm_year = etaStr.substring(0, 4).toInt() - 1900;
+              etaTm.tm_mon = etaStr.substring(5, 7).toInt() - 1;
+              etaTm.tm_mday = etaStr.substring(8, 10).toInt();
+              etaTm.tm_hour = etaStr.substring(11, 13).toInt();
+              etaTm.tm_min = etaStr.substring(14, 16).toInt();
+              etaTm.tm_sec = etaStr.substring(17, 19).toInt();
+              time_t busTime = mktime(&etaTm);
+              int diffMin = (int)(difftime(busTime, now) / 60);
+
+              if (diffMin <= 0) updateBusRow(rowIndex, r, "0", dest);
+              else updateBusRow(rowIndex, r, String(diffMin), dest);
+              found = true;
+              break;
+            }
+          }
+        }
+        if (!found) updateBusRow(rowIndex, r, "!", "N/A");
+      }
+      http.end();
+      rowIndex++;
+      delay(150);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  tft.init();
+  tft.setRotation(1);
+  pinMode(21, OUTPUT);
+  analogWrite(21, 128);
+  digitalWrite(21, HIGH);
+
+  // --- SD 卡檢查區塊 ---
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD Fail");
+    while (1)
+      ;  // 如果 SD 失敗就停在這裡
+  }
+  // --- SD 檢查結束 ---
+
+  // 這裡才是正確的位置！不管 SD 卡成不成功，都要讀取設定
+  prefs.begin("KMB-ETA", true);
+  savedWeatherLocation = prefs.getString("location", "黃大仙");
+  savedDataJSON = prefs.getString("data", "[]");
+  prefs.end();
+
+  Serial.println("--- Startup Check ---");
+  Serial.print("Location from Flash: ");
+  Serial.println(savedWeatherLocation);
+
+  WiFiManager wm;
+  wm.autoConnect("ESP32 Wifi");
+
+  server.on("/set_brightness", []() {
+  if (server.hasArg("v")) {
+    int brightness = server.arg("v").toInt();
+    analogWrite(21, brightness);
+    // 可選：存入 Preferences 永久記住亮度
+    prefs.begin("KMB-ETA", false);
+    prefs.putInt("brt", brightness);
+    prefs.end();
+  }
+  server.send(200);
+});
+
+  if (MDNS.begin("KMB-ETA")) {
+    Serial.println("MDNS: http://KMB-ETA.local");
+  }
+
+  configTime(28800, 0, "pool.ntp.org", "stdtime.gov.hk");
+
+  prefs.begin("KMB-ETA", false);
+  savedDataJSON = prefs.getString("data", "[]");
+  prefs.end();
+
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/reset_wifi", handleResetWifi);
+  server.begin();
+
+  drawBmp("/kmb.bmp", 0, 0, 320, 240);  // 畫全屏底圖
+  refreshLeftArea();                    // 覆蓋左側日夜圖
+  fetchMultiKMBData();
+}
+
+void loop() {
+  server.handleClient();
+  unsigned long now = millis();
+
+  // 每 30 秒檢查一次日夜狀態並刷新左側
+  static unsigned long lastLeftUpdate = 0;
+  if (now - lastLeftUpdate > 5000) {
+    refreshLeftArea();
+    lastLeftUpdate = now;
+  }
+
+  // 巴士數據更新 (每 5 秒)
+  static unsigned long lastBusUpdate = 0;
+  if (now - lastBusUpdate > 5000) {
+    fetchMultiKMBData();
+    lastBusUpdate = now;
+  }
+}
