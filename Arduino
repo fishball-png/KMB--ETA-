@@ -452,17 +452,23 @@ void setup() {
   Serial.begin(115200);
   tft.init();
   tft.setRotation(1);
+  // CYD backlight is GPIO 21, active high. analogWrite owns the pin via
+  // LEDC, so a following digitalWrite does not change the level.
   pinMode(21, OUTPUT);
-  analogWrite(21, 128);
-  digitalWrite(21, HIGH);
+  analogWrite(21, 255);
+  tft.fillScreen(TFT_WHITE);
 
   // --- SD 卡檢查區塊 ---
   if (!SD.begin(SD_CS)) {
     Serial.println("SD Fail");
+    tft.fillScreen(TFT_RED);
     while (1)
       ;  // 如果 SD 失敗就停在這裡
   }
   // --- SD 檢查結束 ---
+
+  // WiFiManager's setup portal blocks, so paint before it starts.
+  drawBmp("/kmb.bmp", 0, 0, 320, 240);
 
   // 這裡才是正確的位置！不管 SD 卡成不成功，都要讀取設定
   prefs.begin("KMB-ETA", true);
@@ -504,8 +510,7 @@ void setup() {
   server.on("/reset_wifi", handleResetWifi);
   server.begin();
 
-  drawBmp("/kmb.bmp", 0, 0, 320, 240);  // 畫全屏底圖
-  refreshLeftArea();                    // 覆蓋左側日夜圖
+  refreshLeftArea();  // 覆蓋左側日夜圖
   fetchMultiKMBData();
 }
 
